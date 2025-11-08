@@ -469,7 +469,7 @@ def create_safe_plot(figsize=(10, 6)):
     return fig, ax
 
 
-@st.cache_data
+@st.cache_resource
 def analyze_text(text):
     """Cache the text analyzer initialization"""
     return TextAnalyzer(text)
