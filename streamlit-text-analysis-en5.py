@@ -15,6 +15,8 @@ from nrclex import NRCLex
 import matplotlib
 import warnings
 from functools import lru_cache
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.decomposition import LatentDirichletAllocation, NMF
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -245,6 +247,96 @@ class TextAnalyzer:
 
         return pd.DataFrame(sentence_emotions)
 
+    def topic_modeling_lda(self, n_topics=5, n_top_words=10, method='lda'):
+        """
+        Perform topic modeling using LDA or NMF.
+
+        Args:
+            n_topics (int): Number of topics to extract
+            n_top_words (int): Number of top words per topic
+            method (str): 'lda' or 'nmf'
+
+        Returns:
+            dict: Dictionary containing topic information
+        """
+        # Check if we have enough sentences
+        if len(self.sentences) < 3:
+            return None
+
+        # Prepare documents (use sentences as documents)
+        documents = self.sentences
+
+        # Create document-term matrix
+        if method == 'lda':
+            vectorizer = CountVectorizer(
+                max_df=0.85,
+                min_df=2,
+                stop_words='english',
+                max_features=1000
+            )
+        else:  # nmf
+            vectorizer = TfidfVectorizer(
+                max_df=0.85,
+                min_df=2,
+                stop_words='english',
+                max_features=1000
+            )
+
+        try:
+            doc_term_matrix = vectorizer.fit_transform(documents)
+
+            # Fit the model
+            if method == 'lda':
+                model = LatentDirichletAllocation(
+                    n_components=n_topics,
+                    random_state=42,
+                    max_iter=20,
+                    learning_method='online'
+                )
+            else:  # nmf
+                model = NMF(
+                    n_components=n_topics,
+                    random_state=42,
+                    max_iter=200
+                )
+
+            doc_topic_dist = model.fit_transform(doc_term_matrix)
+
+            # Get feature names
+            feature_names = vectorizer.get_feature_names_out()
+
+            # Extract topics
+            topics = {}
+            for topic_idx, topic in enumerate(model.components_):
+                top_indices = topic.argsort()[-n_top_words:][::-1]
+                top_words = [feature_names[i] for i in top_indices]
+                top_weights = [topic[i] for i in top_indices]
+                topics[f'Topic {topic_idx + 1}'] = {
+                    'words': top_words,
+                    'weights': top_weights
+                }
+
+            # Get dominant topic for each document
+            dominant_topics = []
+            for i, doc_dist in enumerate(doc_topic_dist):
+                dominant_topic = doc_dist.argmax()
+                dominant_topics.append({
+                    'Sentence': documents[i][:100] + '...' if len(documents[i]) > 100 else documents[i],
+                    'Dominant Topic': f'Topic {dominant_topic + 1}',
+                    'Topic Weight': doc_dist[dominant_topic]
+                })
+
+            return {
+                'topics': topics,
+                'doc_topic_dist': doc_topic_dist,
+                'dominant_topics': pd.DataFrame(dominant_topics),
+                'model': model,
+                'vectorizer': vectorizer
+            }
+
+        except Exception as e:
+            return None
+
 
 def create_safe_plot(figsize=(10, 6)):
     """Create a matplotlib figure with safe settings"""
@@ -253,7 +345,7 @@ def create_safe_plot(figsize=(10, 6)):
     return fig, ax
 
 
-@st.cache_data
+@st.cache_resource
 def analyze_text(text):
     """Cache the text analyzer initialization"""
     return TextAnalyzer(text)
@@ -266,7 +358,7 @@ def main():
         st.header("Analysis Options")
         analysis_tab = st.radio(
             "Select Analysis View",
-            ["Basic Analysis", "Sentiment Analysis", "Emotion Analysis"]
+            ["Basic Analysis", "Sentiment Analysis", "Emotion Analysis", "Topic Modeling"]
         )
 
     # File upload
@@ -585,6 +677,214 @@ def main():
 
                 except Exception as e:
                     st.error(f"Error in sentence-level emotion analysis: {str(e)}")
+
+            elif analysis_tab == "Topic Modeling":
+                st.header('Topic Modeling Analysis')
+
+                st.markdown("""
+                Topic modeling helps identify the main themes or topics in your text.
+                This analysis uses **Latent Dirichlet Allocation (LDA)** or **Non-negative Matrix Factorization (NMF)**
+                to discover hidden topics based on word patterns.
+                """)
+
+                # Check if we have enough text
+                if len(analyzer.sentences) < 3:
+                    st.warning("Topic modeling requires at least 3 sentences. Your text is too short for meaningful topic analysis.")
+                else:
+                    # Model selection and parameters
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        method = st.selectbox(
+                            "Select Method",
+                            ["lda", "nmf"],
+                            format_func=lambda x: "LDA (Latent Dirichlet Allocation)" if x == "lda" else "NMF (Non-negative Matrix Factorization)"
+                        )
+
+                    with col2:
+                        n_topics = st.slider("Number of Topics", min_value=2, max_value=10, value=5)
+
+                    with col3:
+                        n_words = st.slider("Words per Topic", min_value=5, max_value=20, value=10)
+
+                    # Perform topic modeling
+                    try:
+                        with st.spinner('Extracting topics...'):
+                            topic_results = analyzer.topic_modeling_lda(
+                                n_topics=n_topics,
+                                n_top_words=n_words,
+                                method=method
+                            )
+
+                        if topic_results is None:
+                            st.error("Could not perform topic modeling. Make sure your text has enough content and variety.")
+                        else:
+                            topics = topic_results['topics']
+                            doc_topic_dist = topic_results['doc_topic_dist']
+                            dominant_topics_df = topic_results['dominant_topics']
+
+                            # Display topics
+                            st.subheader("Discovered Topics")
+
+                            # Create columns for topics
+                            cols_per_row = 2
+                            topic_items = list(topics.items())
+
+                            for i in range(0, len(topic_items), cols_per_row):
+                                cols = st.columns(cols_per_row)
+                                for j, (topic_name, topic_data) in enumerate(topic_items[i:i+cols_per_row]):
+                                    with cols[j]:
+                                        st.markdown(f"### {topic_name}")
+                                        words_str = ", ".join(topic_data['words'][:8])
+                                        st.info(f"**Top words:** {words_str}")
+
+                            # Visualize topics as word clouds/bar charts
+                            st.subheader("Topic Word Distributions")
+
+                            for topic_name, topic_data in topics.items():
+                                try:
+                                    fig, ax = create_safe_plot(figsize=(10, 4))
+
+                                    words = topic_data['words'][:n_words]
+                                    weights = topic_data['weights'][:n_words]
+
+                                    # Normalize weights for better visualization
+                                    weights = np.array(weights)
+                                    weights = weights / weights.sum()
+
+                                    # Create color palette
+                                    colors_palette = plt.cm.viridis(np.linspace(0.3, 0.9, len(words)))
+
+                                    bars = ax.barh(range(len(words)), weights, color=colors_palette)
+                                    ax.set_yticks(range(len(words)))
+                                    ax.set_yticklabels(words)
+                                    ax.set_xlabel('Weight')
+                                    ax.set_title(f'{topic_name} - Top Words')
+                                    ax.invert_yaxis()
+
+                                    # Add value labels
+                                    for i, (bar, weight) in enumerate(zip(bars, weights)):
+                                        width = bar.get_width()
+                                        ax.text(width, bar.get_y() + bar.get_height()/2,
+                                               f' {weight:.3f}',
+                                               va='center', ha='left', fontsize=9)
+
+                                    plt.tight_layout()
+                                    st.pyplot(fig)
+                                    plt.close(fig)
+
+                                except Exception as e:
+                                    st.error(f"Error creating visualization for {topic_name}: {str(e)}")
+
+                            # Topic distribution across documents
+                            st.subheader("Topic Distribution")
+
+                            try:
+                                fig, ax = create_safe_plot(figsize=(12, 6))
+
+                                # Create heatmap of document-topic distribution
+                                # Limit to first 30 documents for visibility
+                                display_limit = min(30, len(doc_topic_dist))
+                                heatmap_data = doc_topic_dist[:display_limit]
+
+                                im = ax.imshow(heatmap_data.T, aspect='auto', cmap='YlOrRd')
+
+                                # Set ticks and labels
+                                ax.set_yticks(range(n_topics))
+                                ax.set_yticklabels([f'Topic {i+1}' for i in range(n_topics)])
+                                ax.set_xlabel('Sentence Index')
+                                ax.set_ylabel('Topics')
+                                ax.set_title('Topic Distribution Across Sentences')
+
+                                # Add colorbar
+                                cbar = plt.colorbar(im, ax=ax)
+                                cbar.set_label('Topic Weight')
+
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.close(fig)
+
+                            except Exception as e:
+                                st.error(f"Error creating topic distribution visualization: {str(e)}")
+
+                            # Show topic distribution pie chart
+                            st.subheader("Overall Topic Proportions")
+
+                            try:
+                                # Calculate average topic weights across all documents
+                                avg_topic_weights = doc_topic_dist.mean(axis=0)
+
+                                fig, ax = plt.subplots(figsize=(8, 8))
+
+                                colors_pie = plt.cm.Set3(range(n_topics))
+                                patches, texts, autotexts = ax.pie(
+                                    avg_topic_weights,
+                                    labels=[f'Topic {i+1}' for i in range(n_topics)],
+                                    autopct='%1.1f%%',
+                                    colors=colors_pie,
+                                    startangle=90
+                                )
+
+                                for autotext in autotexts:
+                                    autotext.set_color('white')
+                                    autotext.set_fontweight('bold')
+
+                                ax.axis('equal')
+                                ax.set_title('Average Topic Proportions in Text')
+                                st.pyplot(fig)
+                                plt.close(fig)
+
+                            except Exception as e:
+                                st.error(f"Error creating topic proportions chart: {str(e)}")
+
+                            # Dominant topics per sentence
+                            st.subheader("Sentence-Topic Assignments")
+
+                            st.markdown("Each sentence is assigned to its most dominant topic:")
+
+                            # Show statistics
+                            topic_counts = dominant_topics_df['Dominant Topic'].value_counts()
+                            col1, col2 = st.columns([1, 2])
+
+                            with col1:
+                                st.markdown("**Topic Distribution:**")
+                                for topic, count in topic_counts.items():
+                                    percentage = (count / len(dominant_topics_df)) * 100
+                                    st.metric(topic, count, f"{percentage:.1f}%")
+
+                            with col2:
+                                try:
+                                    fig, ax = create_safe_plot()
+                                    colors_bar = plt.cm.Set3(range(len(topic_counts)))
+                                    bars = ax.bar(topic_counts.index, topic_counts.values, color=colors_bar)
+                                    ax.set_xlabel('Topic')
+                                    ax.set_ylabel('Number of Sentences')
+                                    ax.set_title('Sentences per Topic')
+
+                                    # Add value labels
+                                    for bar in bars:
+                                        height = bar.get_height()
+                                        ax.text(bar.get_x() + bar.get_width()/2., height,
+                                               f'{int(height)}',
+                                               ha='center', va='bottom')
+
+                                    plt.xticks(rotation=45)
+                                    plt.tight_layout()
+                                    st.pyplot(fig)
+                                    plt.close(fig)
+
+                                except Exception as e:
+                                    st.error(f"Error creating topic distribution chart: {str(e)}")
+
+                            # Show detailed sentence-topic mapping
+                            with st.expander("View Detailed Sentence-Topic Assignments", expanded=False):
+                                # Sort by topic weight
+                                sorted_df = dominant_topics_df.sort_values('Topic Weight', ascending=False)
+                                st.dataframe(sorted_df, use_container_width=True)
+
+                    except Exception as e:
+                        st.error(f"Error performing topic modeling: {str(e)}")
+                        st.info("Try adjusting the number of topics or make sure your text has sufficient content.")
 
         except Exception as e:
             st.error(f"An error occurred while processing the file: {str(e)}")
