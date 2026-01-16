@@ -1,3 +1,17 @@
+"""
+Greek Text Analysis Tool - Optimized for GitHub Codespaces
+
+Optimizations for resource-constrained environments:
+- Reduced file size limits (10MB for Codespaces vs 50MB)
+- Reduced processing limits (500K chars vs 1M chars)
+- Intelligent sentence sampling for sentiment/emotion analysis (max 50 sentences)
+- Progress indicators for long-running operations
+- Reduced ML model iterations (LDA: 10 vs 20, NMF: 100 vs 200)
+- Aggressive memory cleanup with garbage collection
+- Memory usage monitoring and warnings
+- Lazy loading of heavy transformer models
+"""
+
 import streamlit as st
 import nltk
 import pandas as pd
@@ -19,10 +33,12 @@ from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassifica
 import torch
 import psutil
 import os
+import gc
 
 # Set environment variables to prevent threading issues
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 torch.set_num_threads(1)
 
 # Suppress warnings
@@ -33,6 +49,13 @@ matplotlib.use('Agg')
 plt.rcParams['font.family'] = 'DejaVu Sans'
 plt.rcParams['font.size'] = 10
 plt.rcParams['axes.unicode_minus'] = False
+
+# Codespaces optimization settings
+CODESPACES_MODE = True  # Set to True for resource-constrained environments
+MAX_TEXT_SIZE_MB = 10 if CODESPACES_MODE else 50  # Reduced for Codespaces
+MAX_PROCESS_CHARS = 500000 if CODESPACES_MODE else 1000000  # 500K chars for Codespaces
+MAX_SENTENCES_FOR_SENTIMENT = 50 if CODESPACES_MODE else 100  # Limit sentence analysis
+SENTIMENT_BATCH_SIZE = 8  # Process sentences in batches
 
 
 def get_memory_usage():
@@ -58,18 +81,32 @@ def get_stopwords():
 
 @st.cache_resource
 def load_greek_sentiment_model():
-    """Load Greek sentiment analysis model using XLM-RoBERTa"""
+    """Load Greek sentiment analysis model using XLM-RoBERTa (only when needed)"""
     try:
-        # Using a multilingual model that works well with Greek
-        model_name = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
-        tokenizer = XLMRobertaTokenizer.from_pretrained(model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(model_name)
-        # Force CPU usage to reduce memory
-        sentiment_analyzer = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer,
-                                     max_length=512, truncation=True, device=-1)
-        return sentiment_analyzer
+        # Check available memory before loading
+        process = psutil.Process(os.getpid())
+        memory_mb = process.memory_info().rss / 1024 / 1024
+
+        if memory_mb > 1500 and CODESPACES_MODE:  # Warning if already using > 1.5GB
+            st.warning("⚠️ High memory usage detected. Sentiment analysis may be slow or unavailable.")
+
+        with st.spinner("Loading sentiment analysis model (this may take a moment)..."):
+            # Using a multilingual model that works well with Greek
+            model_name = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
+            tokenizer = XLMRobertaTokenizer.from_pretrained(model_name)
+            model = AutoModelForSequenceClassification.from_pretrained(model_name)
+            # Force CPU usage and reduce batch size to save memory
+            sentiment_analyzer = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer,
+                                         max_length=512, truncation=True, device=-1,
+                                         batch_size=1)  # Process one at a time to save memory
+
+            # Force garbage collection after loading
+            gc.collect()
+
+            return sentiment_analyzer
     except Exception as e:
         st.error(f"Error loading sentiment model: {e}")
+        st.info("💡 Try restarting the app or using a machine with more available memory.")
         return None
 
 
@@ -124,15 +161,16 @@ class TextAnalyzer:
         Args:
             text (str): The full text to be analyzed
         """
-        # Check text size limit (50MB max)
-        if len(text.encode('utf-8')) > 50 * 1024 * 1024:
-            raise ValueError("Text file too large. Maximum size is 50MB.")
+        # Check text size limit (dynamic based on CODESPACES_MODE)
+        max_bytes = MAX_TEXT_SIZE_MB * 1024 * 1024
+        if len(text.encode('utf-8')) > max_bytes:
+            raise ValueError(f"Text file too large. Maximum size is {MAX_TEXT_SIZE_MB}MB.")
 
         # Clean and store text
         self.original_text = self.clean_text_for_display(text)
 
-        # Limit text length for processing (first 1M characters)
-        self.process_text = self.original_text[:1000000] if len(self.original_text) > 1000000 else self.original_text
+        # Limit text length for processing (use dynamic limit)
+        self.process_text = self.original_text[:MAX_PROCESS_CHARS] if len(self.original_text) > MAX_PROCESS_CHARS else self.original_text
 
         # Lazy initialization
         self._nlp = None
@@ -143,6 +181,12 @@ class TextAnalyzer:
         self._cleaned_tokens = None
         self._pos_counts = None
         self._sentiment_analyzer = None
+
+        # Add truncation warning if needed
+        if len(self.original_text) > MAX_PROCESS_CHARS:
+            self.truncation_warning = f"⚠️ Text truncated to {MAX_PROCESS_CHARS:,} characters for processing efficiency."
+        else:
+            self.truncation_warning = None
 
     @property
     def sentiment_analyzer(self):
@@ -296,7 +340,7 @@ class TextAnalyzer:
 
     def sentence_sentiment_analysis(self):
         """
-        Analyze sentiment for each sentence.
+        Analyze sentiment for each sentence with sampling for large texts.
 
         Returns:
             pd.DataFrame: DataFrame containing sentences and their sentiment scores
@@ -306,8 +350,34 @@ class TextAnalyzer:
 
         data = {'Sentence': [], 'Polarity': [], 'Subjectivity': [], 'Sentiment': []}
 
-        for sentence in self.sentences:
+        # Sample sentences if there are too many (for Codespaces efficiency)
+        sentences_to_analyze = self.sentences
+        total_sentences = len(sentences_to_analyze)
+        sampled = False
+
+        if total_sentences > MAX_SENTENCES_FOR_SENTIMENT:
+            # Intelligently sample: take first, last, and evenly spaced middle sentences
+            step = total_sentences // MAX_SENTENCES_FOR_SENTIMENT
+            indices = list(range(0, total_sentences, step))[:MAX_SENTENCES_FOR_SENTIMENT]
+            sentences_to_analyze = [self.sentences[i] for i in indices]
+            sampled = True
+
+        # Create progress bar if processing many sentences
+        if len(sentences_to_analyze) > 10:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+        else:
+            progress_bar = None
+            status_text = None
+
+        for idx, sentence in enumerate(sentences_to_analyze):
             try:
+                # Update progress
+                if progress_bar is not None:
+                    progress = (idx + 1) / len(sentences_to_analyze)
+                    progress_bar.progress(progress)
+                    status_text.text(f'Analyzing sentence {idx + 1} of {len(sentences_to_analyze)}...')
+
                 # Truncate sentence if too long
                 sentence_text = sentence[:512]
                 result = self.sentiment_analyzer(sentence_text)[0]
@@ -335,13 +405,28 @@ class TextAnalyzer:
                 data['Subjectivity'].append(confidence)
                 data['Sentiment'].append(sentiment)
 
-            except Exception:
+            except Exception as e:
                 data['Sentence'].append(sentence)
                 data['Polarity'].append(0.0)
                 data['Subjectivity'].append(0.5)
                 data['Sentiment'].append('Neutral')
 
-        return pd.DataFrame(data)
+            # Periodic garbage collection for memory efficiency
+            if idx % 20 == 0:
+                gc.collect()
+
+        # Clear progress indicators
+        if progress_bar is not None:
+            progress_bar.empty()
+            status_text.empty()
+
+        df = pd.DataFrame(data)
+
+        # Add note about sampling if applied
+        if sampled:
+            st.info(f"ℹ️ Analyzed {len(sentences_to_analyze)} sampled sentences out of {total_sentences} total sentences for efficiency.")
+
+        return df
 
     def emotion_analysis_from_lexicon(self, text):
         """
@@ -386,14 +471,25 @@ class TextAnalyzer:
 
     def sentence_emotion_analysis(self):
         """
-        Analyze emotions for each sentence.
+        Analyze emotions for each sentence with sampling for large texts.
 
         Returns:
             pd.DataFrame: DataFrame containing sentences and their emotion scores
         """
         sentence_emotions = []
 
-        for sentence in self.sentences:
+        # Sample sentences if there are too many
+        sentences_to_analyze = self.sentences
+        total_sentences = len(sentences_to_analyze)
+        sampled = False
+
+        if total_sentences > MAX_SENTENCES_FOR_SENTIMENT:
+            step = total_sentences // MAX_SENTENCES_FOR_SENTIMENT
+            indices = list(range(0, total_sentences, step))[:MAX_SENTENCES_FOR_SENTIMENT]
+            sentences_to_analyze = [self.sentences[i] for i in indices]
+            sampled = True
+
+        for sentence in sentences_to_analyze:
             emotions = self.emotion_analysis_from_lexicon(sentence)
 
             emotion_dict = {
@@ -418,7 +514,13 @@ class TextAnalyzer:
 
             sentence_emotions.append(emotion_dict)
 
-        return pd.DataFrame(sentence_emotions)
+        df = pd.DataFrame(sentence_emotions)
+
+        # Add note about sampling if applied
+        if sampled:
+            st.info(f"ℹ️ Analyzed {len(sentences_to_analyze)} sampled sentences out of {total_sentences} total sentences for efficiency.")
+
+        return df
 
     def topic_modeling_lda(self, n_topics=5, n_top_words=10, method='lda'):
         """
@@ -459,22 +561,30 @@ class TextAnalyzer:
         try:
             doc_term_matrix = vectorizer.fit_transform(documents)
 
-            # Fit the model
+            # Fit the model with reduced iterations for Codespaces
             if method == 'lda':
+                max_iter_lda = 10 if CODESPACES_MODE else 20
                 model = LatentDirichletAllocation(
                     n_components=n_topics,
                     random_state=42,
-                    max_iter=20,
-                    learning_method='online'
+                    max_iter=max_iter_lda,
+                    learning_method='online',
+                    n_jobs=1  # Single thread for stability
                 )
             else:  # nmf
+                max_iter_nmf = 100 if CODESPACES_MODE else 200
                 model = NMF(
                     n_components=n_topics,
                     random_state=42,
-                    max_iter=200
+                    max_iter=max_iter_nmf,
+                    init='nndsvda'  # Faster initialization
                 )
 
-            doc_topic_dist = model.fit_transform(doc_term_matrix)
+            with st.spinner(f'Training {method.upper()} model...'):
+                doc_topic_dist = model.fit_transform(doc_term_matrix)
+
+            # Force garbage collection after model training
+            gc.collect()
 
             # Get feature names
             feature_names = vectorizer.get_feature_names_out()
@@ -513,7 +623,8 @@ class TextAnalyzer:
 
 
 def create_safe_plot(figsize=(10, 6)):
-    """Create a matplotlib figure with safe settings"""
+    """Create a matplotlib figure with safe settings and memory cleanup"""
+    plt.close('all')  # Close all previous figures
     plt.clf()
     fig, ax = plt.subplots(figsize=figsize)
     return fig, ax
@@ -528,6 +639,10 @@ def analyze_text(text):
 def main():
     st.title('Εργαλείο Ανάλυσης Κειμένου')  # Text Analysis Tool in Greek
 
+    # Show Codespaces optimization notice
+    if CODESPACES_MODE:
+        st.info("🚀 Running in optimized mode for GitHub Codespaces. Text size and processing limits are adjusted for efficient performance.")
+
     with st.sidebar:
         st.header("Επιλογές Ανάλυσης")  # Analysis Options
         analysis_tab = st.radio(
@@ -539,7 +654,20 @@ def main():
         st.divider()
         st.subheader("📊 Χρήση Μνήμης")
         memory_usage = get_memory_usage()
-        st.metric("Μνήμη Εφαρμογής", memory_usage)
+        memory_color = "normal"
+        try:
+            mem_mb = float(memory_usage.split()[0])
+            if mem_mb > 1500:
+                memory_color = "inverse"
+        except:
+            pass
+        st.metric("Μνήμη Εφαρμογής", memory_usage, delta="High" if memory_color == "inverse" else None)
+
+        # Show limits
+        if CODESPACES_MODE:
+            st.divider()
+            st.caption(f"📝 Max file size: {MAX_TEXT_SIZE_MB}MB")
+            st.caption(f"📝 Max processing: {MAX_PROCESS_CHARS:,} chars")
 
     # File upload
     uploaded_file = st.file_uploader("Επιλέξτε ένα αρχείο κειμένου", type=['txt'])
@@ -551,6 +679,10 @@ def main():
 
             # Create analyzer with caching (this will check file size)
             analyzer = analyze_text(text)
+
+            # Show truncation warning if applicable
+            if analyzer.truncation_warning:
+                st.warning(analyzer.truncation_warning)
 
             with st.expander("Προβολή Περιεχομένου Κειμένου", expanded=False):
                 st.text_area('Περιεχόμενο Κειμένου', text, height=200)
@@ -1046,13 +1178,16 @@ def main():
 
         except ValueError as e:
             if "Text file too large" in str(e):
-                st.error("Το αρχείο κειμένου είναι πολύ μεγάλο. Το μέγιστο επιτρεπόμενο μέγεθος είναι 50MB.")
+                st.error(f"Το αρχείο κειμένου είναι πολύ μεγάλο. Το μέγιστο επιτρεπόμενο μέγεθος είναι {MAX_TEXT_SIZE_MB}MB.")
                 st.info("Παρακαλώ χωρίστε το αρχείο σε μικρότερα τμήματα ή χρησιμοποιήστε ένα μικρότερο αρχείο.")
             else:
                 st.error(f"Σφάλμα επικύρωσης αρχείου: {str(e)}")
         except Exception as e:
             st.error(f"Παρουσιάστηκε σφάλμα κατά την επεξεργασία του αρχείου: {str(e)}")
             st.error("Παρακαλώ βεβαιωθείτε ότι το αρχείο είναι έγκυρο αρχείο κειμένου και δοκιμάστε ξανά.")
+
+            # Cleanup on error
+            gc.collect()
 
 if __name__ == "__main__":
     main()
